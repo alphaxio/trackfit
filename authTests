@@ -1,0 +1,606 @@
+<?php
+
+namespace App\Http\Controllers\API\v1\Auth;
+
+use Illuminate\Support\Facades\Validator;
+use App\Http\Controllers\Controller;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Str;
+use Carbon\Carbon;
+use App\Http\Resources\v1\UserResource;
+use App\Models\User;
+use Illuminate\Validation\Rules\Password;
+use Spatie\Permission\Models\Role;
+use App\Traits\ApiResponses;
+use Attribute;
+use Illuminate\Http\Request;
+use Twilio\Rest\Client;
+use Laravel\Passport\Passport;
+use Illuminate\Support\Facades\Log;
+use Exception;
+// use Google_Client;
+use Laravel\Socialite\Facades\Socialite;
+use Laravel\Socialite\Two\User as ProviderUser;
+use GuzzleHttp\Exception\ClientException;
+use Illuminate\Support\Facades\Http;
+
+class AuthController extends Controller
+{
+    use ApiResponses;
+
+    private function getToken($user)
+    {
+        Passport::personalAccessTokensExpireIn(now()->addDays(30));
+        return $user->createToken('Personal Access Token');
+    }
+
+
+
+    private function randomToken(){
+        $random_token  = rand(1000, 9000);
+        $random_token_exists = User::query()
+            ->where('password_reset_token', $random_token)
+            ->orWhere('otp', $random_token)
+            ->exists();
+        if ($random_token_exists) {
+            return $this->randomToken();
+        }
+        return $random_token;
+    }
+
+
+
+    public function client()
+    {
+    $client = new \Google_Client();
+    $client->setClientId(env('GOOGLE_CLIENT_ID'));
+    $client->setClientSecret(env('GOOGLE_CLIENT_SECRET'));
+    $client->setRedirectUri(env('GOOGLE_REDIRECT_URL'));
+    return $client;
+    }
+
+
+    private function slug(): \Ramsey\Uuid\UuidInterface
+    {
+        $slug = Str::uuid();
+        $slug_exists = User::query()
+            ->where('slug', $slug)
+            ->exists();
+        if ($slug_exists) {
+            return $this->slug();
+        }
+        return $slug;
+    }
+
+
+    public function redirectToGoogle()
+    {
+        return Socialite::driver('google')->redirect();
+    }
+
+    public function handleGoogleCallback()
+    {
+        try {
+
+            $user = Socialite::driver('google')->user();
+
+            $finduser = User::where('provider_id', $user->id)->first();
+
+            if($finduser){
+                Auth::login($finduser);
+                $user_data = new UserResource($user);
+                $token = $this->getToken($user);
+                $message = 'Registration Successful, An OTP has been sent to your phone number';
+                return $this->okayApiResponse([
+                    'message' => $message,
+                    'user' => $user_data,
+                    'token' => $token,
+                ]);
+
+                // return redirect()->intended('dashboard');
+            }else{
+                $user = User::create([
+                    'first_name' => $user->name,
+                    'email' => $user->email,
+                    'google_id'=> $user->id,
+                    'password' => encrypt('123456dummy'),
+                    'slug' => $this->slug()
+                ]);
+                $role = Role::where('name', 'USER')->firstorFail();
+                $user->assignRole($role);
+
+                Auth::login($user);
+                $user_data = new UserResource($user);
+                $token = $this->getToken($user);
+                $message = 'Registration Successful, An OTP has been sent to your phone number';
+                return $this->okayApiResponse([
+                    'message' => $message,
+                    'user' => $user_data,
+                    'token' => $token,
+                ]);
+                // return redirect()->intended('dashboard');
+            }
+
+        } catch (Exception $exception) {
+            return $this->errorApiResponse($exception->getMessage(), 500);
+        }
+    }
+
+
+    public function google(Request $request)
+    {
+        $provider = "google"; // or $request->input('provider_name') for multiple providers
+        // $token = $request->input('access_token');
+        // $token = $this->getToken($user);
+        // get the provider's user. (In the provider server)
+        $user = Socialite::driver($provider)->user();
+        // $providerUser = Socialite::driver($provider)->userFromToken($token);
+        // check if access token exists etc..
+        // search for a user in our server with the specified provider id and provider name
+        $user = User::where('provider_name', $provider)->where('provider_id', $user->id)->first();
+        // if there is no record with these data, create a new user
+        if($user == null){
+            $user = User::create([
+                'provider_name' => $provider,
+                'provider_id' => $user->id,
+            ]);
+        }
+        // $token = $user->createToken(env('APP_NAME'))->accessToken;
+        // create a token for the user, so they can login
+        $token =  $this->getToken($user);
+        // return the token for usage
+        return response()->json([
+            'success' => true,
+            'token' => $token
+        ]);
+    }
+
+    public function socialLogin(Request $request)
+{
+    $provider = "google"; // or $request->input('provider_name') for multiple providers
+    $token = $request->input('access_token');
+    // get the provider's user. (In the provider server)
+    $providerUser = Socialite::driver($provider)->userFromToken($token);
+
+    dd($providerUser);
+    // check if access token exists etc..
+    // search for a user in our server with the specified provider id and provider name
+    $user = User::where('provider_name', $provider)->where('provider_id', $providerUser->id)->first();
+    // if there is no record with these data, create a new user
+    if($user == null){
+        $user = User::create([
+            'provider_name' => $provider,
+            'provider_id' => $providerUser->id,
+        ]);
+    }
+    // create a token for the user, so they can login
+    $token = $user->createToken(env('APP_NAME'))->accessToken;
+    // return the token for usage
+    return response()->json([
+        'success' => true,
+        'token' => $token
+    ]);
+}
+
+    /**
+     * Login a user as a .
+     *
+     * @param  Request  $request
+     * @return JsonResponse
+     */
+    public function login(Request $request): JsonResponse
+    {
+        try{
+            $validation = Validator::make($request->all(), [
+                'phone_number' => ['bail', 'required', 'string', 'min:10'],
+            ]);
+            if ($validation->fails()) {
+                $message = $validation->messages()->first();
+                return $this->errorApiResponse($message, 422);
+            }
+            // dd($validation->validated());
+            $attribute = $validation->validated();
+            // dd($attribute['phone_number']);
+            //find user =
+            $user = User::where('phone_number', $attribute['phone_number'])->first();
+            // dd($user);
+
+            if(! $user)
+            {
+                return $this->errorApiResponse('Invalid login credentials', 422);
+            }
+            $token = $user->createToken('Laravel Password Grant Client')->accessToken;
+            // dd($authenticated);
+            // $authenticated  = Auth::attempt(['phone_number' => $authenticated['phone_number'], 'password' => null]);
+            // if (! $authenticated) {
+            //     return $this->unauthorizedApiResponse();
+            // }
+            // $user = Auth::user();
+            // $roles = $user->getRoleNames();
+            $user_data = new UserResource($user);
+            $token = $this->getToken($user);
+            return $this->okayApiResponse([
+                'user' => $user_data,
+                'token' => $token,
+                // 'roles' => $roles
+            ]);
+        }catch (\Exception $exception){
+            return $this->errorApiResponse($exception->getMessage(), 500);
+        }
+    }
+
+
+    /**
+     * Authorization a user as a user.
+     *
+     * @param  Request  $request
+     * @return JsonResponse
+     */
+    public function authorization(Request $request): JsonResponse
+    {
+        try{
+            $validation = Validator::make($request->all(), [
+                'phone_number' => ['bail', 'required', 'string', 'min:10'],
+            ]);
+            if ($validation->fails()) {
+                $message = $validation->messages()->first();
+                return $this->errorApiResponse($message, 422);
+            }
+            $attribute = $validation->validated();
+
+            $user = User::where('phone_number', $attribute['phone_number'])->first();
+
+            if($user){
+                $token = $user->createToken('Laravel Password Grant Client')->accessToken;
+                $user_data = new UserResource($user);
+                $token = $this->getToken($user);
+                return $this->okayApiResponse([
+                    'user' => $user_data,
+                    'token' => $token,
+                ]);
+            }
+            else {
+
+                $slug = $this->slug();
+                $otp = $this->randomToken();
+                $user = User::create([
+                    'slug' => $slug,
+                    'phone_number' => $attribute['phone_number'],
+                    'otp' => $otp,
+                ]);
+                $role = Role::where('name', 'USER')->firstorFail();
+                $user->assignRole($role);
+                Auth::login($user);
+                $twilio_number = "+15674595824" ?? getenv("TWILIO_FROM");
+                //production
+                $account_sid = 'AC78472fc29e77662e966749ef4ee735b2';
+                $auth_token = 'c13cf62ac8f5d1885dbe192e2f6e5790';
+
+                $message = 'Your OTP is '. $otp;
+                // $phone_number = '+'.$attribute['phone_number'];
+                $phone_number = $attribute['phone_number'];
+
+                $client = new Client($account_sid, $auth_token);
+                $client->messages->create($phone_number, [
+                    'from' => $twilio_number,
+                    'body' => $message]);
+
+                $user_data = new UserResource($user);
+                $token = $this->getToken($user);
+                $message = 'Registration Successful, An OTP has been sent to your phone number';
+                return $this->okayApiResponse([
+                    'message' => $message,
+                    'user' => $user_data,
+                    'token' => $token,
+                ]);
+                Log::info($otp);
+
+            }
+
+        }catch (\Exception $exception){
+            return $this->errorApiResponse($exception->getMessage(), 500);
+        };
+    }
+
+
+    /**
+     * Register a user as a user.
+     *
+     * @param  Request  $request
+     * @return JsonResponse
+     */
+    public function register(Request $request): JsonResponse
+    {
+        try{
+            $validation = Validator::make($request->all(), [
+                'phone_number' => ['bail', 'required', 'string', 'min:10', 'unique:users'],
+            ]);
+            if ($validation->fails()) {
+                $message = $validation->messages()->first();
+                return $this->errorApiResponse($message, 422);
+            }
+            $attribute = $validation->validated();
+            $slug = $this->slug();
+            $otp = $this->randomToken();
+            $user = User::create([
+                'slug' => $slug,
+                'phone_number' => $attribute['phone_number'],
+                'otp' => $otp,
+            ]);
+            $role = Role::where('name', 'USER')->firstorFail();
+            $user->assignRole($role);
+            Auth::login($user);
+            //send otp
+
+            //trial
+            // $account_sid = 'AC4ecf780e3f166c2cc0f43f8345433aec' ?? getenv("TWILIO_SID");
+            // $auth_token = '928d0c4c536376153b31ca57862f7971' ?? getenv("TWILIO_TOKEN");
+
+            $twilio_number = "+15674595824" ?? getenv("TWILIO_FROM");
+
+            //production
+            $account_sid = 'AC78472fc29e77662e966749ef4ee735b2';
+            $auth_token = 'c13cf62ac8f5d1885dbe192e2f6e5790';
+
+            $message = 'Your OTP is '. $otp;
+            // $phone_number = '+'.$attribute['phone_number'];
+            $phone_number = $attribute['phone_number'];
+            // dd($phone_number);
+
+            $client = new Client($account_sid, $auth_token);
+            $client->messages->create($phone_number, [
+                'from' => $twilio_number,
+                'body' => $message]);
+
+            $user_data = new UserResource($user);
+            $token = $this->getToken($user);
+            $message = 'Registration Successful, An OTP has been sent to your phone number';
+            return $this->okayApiResponse([
+                'message' => $message,
+                'user' => $user_data,
+                'token' => $token,
+            ]);
+            Log::info($otp);
+        }catch (\Exception $exception){
+            return $this->errorApiResponse($exception->getMessage(), 500);
+        };
+    }
+
+
+    public function verifyPhone(Request $request)
+    {
+        try{
+            $validation = Validator::make($request->all(), [
+                'otp' => ['bail', 'required', 'integer', 'min:4'],
+            ]);
+            if ($validation->fails()) {
+                $message = $validation->messages()->first();
+                return $this->errorApiResponse($message, 422);
+            }
+
+            $user = auth()->user();
+            if(! $user)
+            {
+                return $this->errorApiResponse('user does not exist', 404);
+            }
+            $attribute = $validation->validated();
+            //save user email
+            if($user->otp  != $attribute['otp'])
+            {
+                return $this->errorApiResponse('Invalid OTP', 404);
+            }
+
+            $user->otp = null;
+            $user->phone_verified_at = Carbon::now();
+            $user->save();
+
+            return $this->successNoDataApiResponse(
+                'Phone number verified successfully'
+            );
+        }catch (\Exception $exception){
+            return $this->errorApiResponse($exception->getMessage(), 500);
+        };
+    }
+
+
+    public function email(Request $request)
+    {
+        try{
+            $validation = Validator::make($request->all(), [
+                'email' => ['bail', 'required', 'string', 'min:10', 'unique:users'],
+            ]);
+            if ($validation->fails()) {
+                $message = $validation->messages()->first();
+                return $this->errorApiResponse($message, 422);
+            }
+
+            $user = auth()->user();
+            if(! $user)
+            {
+                return $this->errorApiResponse('user does not exist', 404);
+            }
+            $attribute = $validation->validated();
+            //save user email
+            $user->email = $attribute['email'];
+            $user->save();
+            $user_data = new UserResource($user);
+            $message = 'Email saved successfully';
+            return $this->okayApiResponse([
+                'message' => $message,
+                'user' => $user_data,
+            ]);
+        }catch (\Exception $exception){
+            return $this->errorApiResponse($exception->getMessage(), 500);
+        };
+    }
+
+    public function resendOTP()
+    {
+        try{
+            $otp = $this->randomToken();
+
+            $user = auth()->user();
+            //save otp
+            $user->otp = $otp;
+            $user->save();
+
+            $twilio_number = "+15674595824" ?? getenv("TWILIO_FROM");
+            $account_sid = 'AC78472fc29e77662e966749ef4ee735b2';
+            $auth_token = 'c13cf62ac8f5d1885dbe192e2f6e5790';
+
+            $message = 'Your OTP is '. $otp;
+            $phone_number = $user->phone_number;
+
+
+
+            $client = new Client($account_sid, $auth_token);
+            $client->messages->create($phone_number, [
+                'from' => $twilio_number,
+                'body' => $message]);
+
+            return $this->successNoDataApiResponse('OTP resent successfully', 200);
+        }catch (\Exception $exception){
+            return $this->errorApiResponse($exception->getMessage(), 500);
+        };
+
+    }
+
+
+
+
+
+
+///////////////////////////////
+
+
+ /**
+     * Redirect the user to the Provider authentication page.
+     *
+     * @param $provider
+     * @return JsonResponse
+     */
+    public function redirectToProvider($provider)
+    {
+        $validated = $this->validateProvider($provider);
+        if (!is_null($validated)) {
+            return $validated;
+        }
+
+        return Socialite::driver($provider)->stateless()->redirect();
+    }
+
+    /**
+     * Obtain the user information from Provider.
+     *
+     * @param $provider
+     * @return JsonResponse
+     */
+    public function handleProviderCallback($provider)
+    {
+        $validated = $this->validateProvider($provider);
+        if (!is_null($validated)) {
+            return $validated;
+        }
+        try {
+            $user = Socialite::driver($provider)->stateless()->user();
+        } catch (ClientException $exception) {
+            return response()->json(['error' => 'Invalid credentials provided.'], 422);
+        }
+
+        $userCreated = User::firstOrCreate(
+            [
+                'email' => $user->getEmail()
+            ],
+            [
+                'email_verified_at' => now(),
+                'name' => $user->getName(),
+                'status' => true,
+            ]
+        );
+        $userCreated->providers()->updateOrCreate(
+            [
+                'provider' => $provider,
+                'provider_id' => $user->getId(),
+            ],
+            [
+                'avatar' => $user->getAvatar()
+            ]
+        );
+        $token = $userCreated->createToken('token-name')->plainTextToken;
+
+        return response()->json($userCreated, 200, ['Access-Token' => $token]);
+    }
+
+    /**
+     * @param $provider
+     * @return JsonResponse
+     */
+    protected function validateProvider($provider)
+    {
+        if (!in_array($provider, ['facebook', 'github', 'google'])) {
+            return response()->json(['error' => 'Please login using facebook, github or google'], 422);
+        }
+    }
+
+
+
+    ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    public function auth(Request $request)
+    {
+        try{
+            $validation = Validator::make($request->all(), [
+                'id_token' => ['bail', 'required', 'string', 'min:10'],
+            ]);
+
+        }catch (\Exception $exception){
+            return $this->errorApiResponse($exception->getMessage(), 500);
+        };
+
+        $attribute = $validation->validated();
+
+        $client = new \Google_Client();
+        $client->setClientId(env('GOOGLE_CLIENT_ID'));
+        $client->setClientSecret(env('GOOGLE_CLIENT_SECRET'));
+        $client->setRedirectUri(env('GOOGLE_REDIRECT_URL'));
+
+
+
+        $CLIENT_ID = "334712771111-qhd81a76oinrqonq0et6rfgk0sgf1ndp.apps.googleusercontent.com";
+
+        $client = new \Google_Client(['client_id' => $CLIENT_ID]);  // Specify the CLIENT_ID of the app that accesses the backend
+
+        $payload = $client->verifyIdToken($attribute['id_token']);
+
+
+
+        if ($payload) {
+            $userid = $payload['sub'];
+            dd($payload);
+            // dd($userid);
+
+        // If request specified a G Suite domain:
+        //$domain = $payload['hd'];
+        } else {
+        // Invalid ID token
+            return 'Invalid';
+        }
+
+        // $user = Http::get('https://oauth2.googleapis.com/tokeninfo?id_token='.$attribute["id_token"].'');
+        //     if(!$user){
+        //         return 'It is empty';
+        //     }else {
+        //         dd($user);
+        //     }
+
+
+    }
+
+
+
+
+
+
+}
